@@ -25,7 +25,13 @@ It can take from 15-60 minutes, depending on your device specs (SLM is hosted on
 
 ```--think```: shows reasoning of the SLM, so you know how exactly the model is sorting your files.
 
-:warning: ```--yolo```: EXPERIMENTAL, yeets all the files in one take, while increasing the maximum context. (Default - batches of 15 files, then finalise all contexts)
+:warning: ```--yolo```: EXPERIMENTAL, yeets all the files in one take, while increasing the maximum context. (Default - batches of 25 files, then finalise all contexts)
+
+```--dry-run```: preview mode — the SLM categorizes your files and shows you a table of where each file *would* go, but **nothing is moved**. Great for testing before committing.
+
+```--undo```: reverses the last sort. Moves all files back to their original locations, cleans up empty category folders, and removes the used manifest. Safe net for when the AI gets creative with categories.
+
+```--rename```: asks the SLM to suggest better filenames when sorting. Turns `IMG_20250410_092340.jpg` into something like `Beach-Sunset.jpg`. Works with `--dry-run` to preview renames before applying.
 
 
 ## Supported OS

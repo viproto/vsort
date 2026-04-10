@@ -7,9 +7,11 @@ validates the results.
 
 from __future__ import annotations
 
+import json
 import logging
 import shutil
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -412,11 +414,17 @@ def execute_sorts(
     directory: Path,
     sorts: Dict[str, str],
     all_filenames: Optional[Set[str]] = None,
+    renames: Optional[Dict[str, str]] = None,
 ) -> DirectoryResult:
     """Move files in *directory* into category subdirectories.
 
     *sorts* maps filenames (relative to *directory*) to category names.
     Categories become subdirectories of *directory*.
+
+    *renames* maps original filenames to suggested new names. When a file
+    is moved to its category directory, it is also renamed if present in
+    this dict. The extension from the original file is preserved if the
+    rename suggestion lacks one.
 
     If *all_filenames* is provided, any files NOT in *sorts* will be
     logged as unaccounted. The function also attempts fuzzy matching
@@ -493,8 +501,20 @@ def execute_sorts(
             ))
             continue
 
-        # Move file
-        dst = cat_dir / src.name
+        # Move file (with optional rename)
+        dest_name = src.name  # default: keep original name
+        if renames and src.name in renames:
+            suggested = renames[src.name]
+            # Sanitize the suggested name
+            safe_rename = _sanitize_filename(suggested)
+            if safe_rename and safe_rename != src.name:
+                # Preserve extension if the rename doesn't include one
+                if not Path(safe_rename).suffix and src.suffix:
+                    safe_rename = safe_rename + src.suffix
+                dest_name = safe_rename
+                logger.info("Renaming %s -> %s", src.name, dest_name)
+
+        dst = cat_dir / dest_name
         try:
             shutil.move(str(src), str(dst))
             result.moves.append(MoveResult(
@@ -549,7 +569,58 @@ def _sanitize_category(name: str) -> str:
     return name
 
 
+def _sanitize_filename(name: str) -> str:
+    """Sanitise a suggested filename for safe filesystem use.
+
+    Removes path separators, null bytes, and other problematic chars.
+    Keeps extensions, hyphens, underscores, dots.
+    """
+    import re
+    name = name.strip()
+    # Remove path separators and null bytes
+    name = name.replace("/", "").replace("\\", "").replace("\0", "")
+    # Replace spaces with hyphens
+    name = re.sub(r"\s+", "-", name)
+    # Remove anything not alphanumeric, hyphen, underscore, or dot
+    # but preserve the dot that separates extension
+    name = re.sub(r"[^A-Za-z0-9_\-\.]", "", name)
+    # Collapse multiple dots (except the extension dot)
+    # e.g. "file..name.txt" -> "file.name.txt"
+    name = re.sub(r"\.{2,}", ".", name)
+    return name
+
+
 # ── Validation & display ──────────────────────────────────────────────
+
+
+def display_preview(directory: Path, sorts: Dict[str, str], renames: Optional[Dict[str, str]] = None) -> None:
+    """Print a rich table previewing the proposed categorization (dry-run)."""
+    table = Table(
+        title=f"[DRY RUN] Proposed Sort: {directory}",
+        show_lines=True,
+        padding=(0, 1),
+    )
+    table.add_column("File", style="cyan", no_wrap=True)
+    table.add_column("Category", style="magenta")
+    table.add_column("Rename", style="yellow")
+    table.add_column("Destination", style="green")
+
+    for filename, category in sorted(sorts.items()):
+        safe_cat = _sanitize_category(category) or category
+        rename_str = ""
+        dest_name = filename
+        if renames and filename in renames:
+            suggested = renames[filename]
+            safe_rename = _sanitize_filename(suggested)
+            if safe_rename and safe_rename != filename:
+                if not Path(safe_rename).suffix and Path(filename).suffix:
+                    safe_rename += Path(filename).suffix
+                rename_str = safe_rename
+                dest_name = safe_rename
+        dest = f"{directory}/{safe_cat}/{dest_name}"
+        table.add_row(filename, safe_cat, rename_str or "—", dest)
+
+    console.print(table)
 
 
 def validate_results(results: List[DirectoryResult]) -> bool:
@@ -582,9 +653,15 @@ def display_results(results: List[DirectoryResult]) -> None:
 
         for move in dr.moves:
             status = "[green]✓[/]" if move.success else f"[red]✗ {move.error or ''}[/]"
+            # Check if the file was renamed (destination name differs from source)
+            src_name = Path(move.src).name
+            dst_name = Path(move.dst).name
+            category = move.category
+            if move.success and dst_name != src_name:
+                category = f"{move.category} [dim](renamed: {dst_name})[/]"
             table.add_row(
-                Path(move.src).name,
-                move.category,
+                src_name,
+                category,
                 move.dst if move.success else "—",
                 status,
             )
@@ -595,3 +672,73 @@ def display_results(results: List[DirectoryResult]) -> None:
             + (f"  [red]{dr.failed} failed.[/]" if dr.failed else "")
             + "\n"
         )
+
+
+# ── Manifest (for --undo) ────────────────────────────────────────────
+
+
+def save_manifest(result: DirectoryResult, renames: Optional[Dict[str, str]] = None) -> Optional[Path]:
+    """Save a manifest JSON recording all successful moves.
+
+    Manifest is written to ~/.vsort/manifests/<timestamp>.json.
+    Returns the manifest path, or None on failure.
+    """
+    from config import MANIFESTS_DIR
+
+    successful_moves = [m for m in result.moves if m.success]
+    if not successful_moves:
+        return None
+
+    MANIFESTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    manifest_path = MANIFESTS_DIR / f"{ts}.json"
+
+    moves_data = []
+    for m in successful_moves:
+        entry = {
+            "src": Path(m.src).name,
+            "dst": str(Path(m.dst).relative_to(Path(result.directory))),
+            "category": m.category,
+        }
+        # Record rename if applicable
+        if renames and Path(m.src).name in renames:
+            entry["original_name"] = Path(m.src).name
+            entry["renamed_to"] = Path(m.dst).name
+        moves_data.append(entry)
+
+    manifest = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "directory": result.directory,
+        "moves": moves_data,
+    }
+
+    try:
+        manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        logger.info("Manifest saved to %s", manifest_path)
+        return manifest_path
+    except OSError as exc:
+        logger.error("Failed to save manifest: %s", exc)
+        return None
+
+
+def load_latest_manifest() -> Optional[Dict]:
+    """Load the most recent manifest from ~/.vsort/manifests/.
+
+    Returns the parsed manifest dict, or None if no manifests exist.
+    """
+    from config import MANIFESTS_DIR
+
+    if not MANIFESTS_DIR.exists():
+        return None
+
+    manifests = sorted(MANIFESTS_DIR.glob("*.json"))
+    if not manifests:
+        return None
+
+    latest = manifests[-1]
+    try:
+        return json.loads(latest.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.error("Failed to load manifest %s: %s", latest, exc)
+        return None

@@ -48,6 +48,7 @@ class LlamaServer:
         self.process: Optional[subprocess.Popen] = None
         self.base_url = f"http://{cfg.host}:{cfg.port}"
         self.last_reasoning: str = ""  # populated by chat_completion()
+        self.last_renames: Dict[str, str] = {}  # populated by sort_files() when rename mode active
 
     # ── lifecycle ──────────────────────────────────────────────────
 
@@ -270,6 +271,8 @@ class LlamaServer:
             file_descriptions = file_descriptions[:MAX_DESC_CHARS] + \
                 "\n[... and more files, truncated]"
 
+        self.last_renames = {}  # reset for this run
+
         system_prompt = (
             "You are a file organizer. Given a list of files with their names "
             "and content samples, organize them into meaningful category folders. "
@@ -290,6 +293,39 @@ class LlamaServer:
             "patterns (e.g. IMG_ = camera photos, Screenshot_ = screenshots, "
             "Screen_Recording_ = screen recordings)."
         )
+
+        # In rename mode, change the output format to also request rename suggestions
+        if self.cfg.rename:
+            system_prompt = (
+                "You are a file organizer. Given a list of files with their names "
+                "and content samples, organize them into meaningful category folders "
+                "AND suggest better filenames. "
+                "Return ONLY valid JSON in this exact format: "
+                '{"sorts": {"filename.ext": {"category": "CategoryName", '
+                '"rename": "Better-Name.ext"}, ...}} '
+                "Categories should be short, human-readable folder names without "
+                "special characters or spaces (use CamelCase or hyphens). "
+                "CRITICAL: You MUST use the ORIGINAL filename as the key — do NOT "
+                "change, shorten, or paraphrase keys. Every file in the input "
+                "must appear in the output with its original name as the key. "
+                "The 'rename' value should be a short, descriptive filename that "
+                "replaces the original cryptic name. Keep the same file extension. "
+                "Use hyphens instead of spaces. Examples: "
+                "IMG_20250410_092340.jpg -> Beach-Sunset.jpg, "
+                "doc123_final_v2.pdf -> Q1-Report-2025.pdf, "
+                "Screenshot_2025-03-15.png -> Error-Message.png. "
+                "If you can't think of a good rename, set 'rename' to the original "
+                "filename. "
+                "Do NOT include any explanatory text, only the JSON object. "
+                "NEVER use 'Images', 'Videos', 'Audio', 'Photos', or similar "
+                "generic media-type names as categories — that just repeats the "
+                "file type and is NOT helpful. Instead, infer what the media "
+                "depicts: use categories like 'Vacation-Photos', 'Screenshots', "
+                "'Work-Diagrams', 'Memes', 'Game-Captures', etc. If you cannot "
+                "determine the content, group by likely context from filename "
+                "patterns (e.g. IMG_ = camera photos, Screenshot_ = screenshots, "
+                "Screen_Recording_ = screen recordings)."
+            )
 
         # Apply sort strategy steering
         strategy = self.cfg.sort_strategy
@@ -325,7 +361,10 @@ class LlamaServer:
 
         raw = self.chat_completion(messages, max_tokens=4096)
         logger.debug("SLM raw response:\n%s", raw)
-        sorts = parse_sort_json(raw)
+        sorts, renames = parse_sort_json_full(raw)
+        if renames:
+            self.last_renames = renames
+            logger.info("Extracted %d rename suggestions", len(renames))
 
         # Post-process: reject generic media-type categories
         _GENERIC_CATEGORIES = {"images", "videos", "audio", "photos", "pictures",
@@ -410,7 +449,9 @@ class LlamaServer:
                     ]
                     raw = self.chat_completion(messages, max_tokens=4096)
                     logger.debug("SLM retry %d response:\n%s", attempt, raw)
-                    sorts = parse_sort_json(raw)
+                    sorts, renames = parse_sort_json_full(raw)
+                    if renames:
+                        self.last_renames.update(renames)
 
                     # Apply vision pass if needed
                     if vision_candidates and self._needs_vision(
@@ -663,52 +704,55 @@ def parse_sort_json(raw: str) -> Dict[str, str]:
          - Fix unescaped quotes inside string values
          - Try robust {"sorts": {...}} pattern matching
       3. If regex fixes still fail, raise ValueError (caller can retry)
+
+    Returns {filename: category} dict. To get renames, use
+    parse_sort_json_full() instead.
+    """
+    result, _ = parse_sort_json_full(raw)
+    return result
+
+
+def parse_sort_json_full(raw: str) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Extract sorts AND renames from an SLM response.
+
+    Returns (sorts_dict, renames_dict) where:
+      sorts_dict = {filename: category}
+      renames_dict = {filename: suggested_new_name}  (empty if rename mode not used)
+
+    Same self-healing logic as parse_sort_json.
     """
     # Step 1: Extract candidate JSON string
     candidate = _extract_json_candidate(raw)
 
     # Step 2: Try direct parse
     first_error: Optional[str] = None
-    try:
-        parsed = json.loads(candidate)
-        return _validate_sorts_dict(parsed)
-    except json.JSONDecodeError as exc:
-        first_error = str(exc)
-        logger.info("Direct JSON parse failed: %s — attempting self-healing", exc)
-
-    # Step 3: Regex-based self-healing
-    healed = _heal_json(candidate)
-    if healed != candidate:
+    for attempt_fn in [lambda c: json.loads(c), lambda c: json.loads(_heal_json(c))]:
         try:
-            parsed = json.loads(healed)
-            logger.info("Self-healed JSON parsed successfully")
-            return _validate_sorts_dict(parsed)
-        except json.JSONDecodeError as healed_error:
-            logger.warning("Self-healed JSON still invalid: %s", healed_error)
+            parsed = attempt_fn(candidate)
+            sorts = _validate_sorts_dict(parsed)
+            renames = _extract_renames(parsed)
+            return sorts, renames
+        except json.JSONDecodeError as exc:
+            if first_error is None:
+                first_error = str(exc)
+            logger.info("JSON parse attempt failed: %s", exc)
+            continue
 
-    # Step 4: Try robust {"sorts": {...}} pattern matching
+    # Step 3: Try robust {"sorts": {...}} pattern matching
     robust_match = re.search(
         r'\{\s*"sorts"\s*:\s*\{[^}]*\}\s*\}',
         raw,
         re.DOTALL,
     )
     if robust_match:
-        try:
-            parsed = json.loads(robust_match.group(0))
-            logger.info("Robust regex extracted valid JSON")
-            return _validate_sorts_dict(parsed)
-        except json.JSONDecodeError:
-            pass
-
-    # Step 5: Try healing the robust match
-    if robust_match:
-        healed_robust = _heal_json(robust_match.group(0))
-        try:
-            parsed = json.loads(healed_robust)
-            logger.info("Healed robust regex match parsed successfully")
-            return _validate_sorts_dict(parsed)
-        except json.JSONDecodeError:
-            pass
+        for attempt_fn in [lambda m: json.loads(m), lambda m: json.loads(_heal_json(m))]:
+            try:
+                parsed = attempt_fn(robust_match.group(0))
+                sorts = _validate_sorts_dict(parsed)
+                renames = _extract_renames(parsed)
+                return sorts, renames
+            except json.JSONDecodeError:
+                continue
 
     logger.error("All JSON parsing attempts failed. Raw:\n%s", raw)
     exc = ValueError(
@@ -814,8 +858,18 @@ def _fix_unescaped_quotes(text: str) -> str:
     return ''.join(result)
 
 
-def _validate_sorts_dict(parsed: Any) -> Dict[str, str]:
-    """Validate that the parsed JSON has the expected structure."""
+def _validate_sorts_dict(parsed: Any, extract_renames: bool = False) -> Dict[str, str]:
+    """Validate that the parsed JSON has the expected structure.
+
+    Handles both formats:
+      Old: {"sorts": {"file.txt": "Category"}}
+      New: {"sorts": {"file.txt": {"category": "Category", "rename": "NewName.txt"}}}
+
+    When extract_renames is True, also populates a side-channel for rename
+    mappings. (Renames are extracted via _extract_renames separately.)
+
+    Returns {filename: category} in all cases.
+    """
     if not isinstance(parsed, dict):
         raise ValueError(f"SLM response is not a dict: {parsed}")
 
@@ -824,4 +878,39 @@ def _validate_sorts_dict(parsed: Any) -> Dict[str, str]:
             f"SLM response JSON missing 'sorts' key or wrong type: {parsed}"
         )
 
-    return {str(k): str(v) for k, v in parsed["sorts"].items()}
+    result: Dict[str, str] = {}
+    for k, v in parsed["sorts"].items():
+        if isinstance(v, str):
+            # Old format: filename -> category string
+            result[str(k)] = v
+        elif isinstance(v, dict):
+            # New format: filename -> {"category": ..., "rename": ...}
+            cat = v.get("category", "")
+            result[str(k)] = str(cat)
+        else:
+            # Fallback: coerce to string
+            result[str(k)] = str(v)
+
+    return result
+
+
+def _extract_renames(parsed: Any) -> Dict[str, str]:
+    """Extract rename suggestions from the parsed JSON (new format only).
+
+    Returns {original_filename: suggested_new_name} for entries that
+    have a "rename" field. Returns empty dict for old-format responses.
+    """
+    if not isinstance(parsed, dict):
+        return {}
+    sorts = parsed.get("sorts", {})
+    if not isinstance(sorts, dict):
+        return {}
+
+    renames: Dict[str, str] = {}
+    for k, v in sorts.items():
+        if isinstance(v, dict) and "rename" in v:
+            rename_val = v["rename"]
+            if rename_val and isinstance(rename_val, str):
+                renames[str(k)] = rename_val
+
+    return renames

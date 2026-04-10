@@ -17,6 +17,7 @@ logger = logging.getLogger(__name__)
 
 CONFIG_DIR = Path.home() / ".vsort"
 CONFIG_FILE = CONFIG_DIR / "config.json"
+MANIFESTS_DIR = CONFIG_DIR / "manifests"
 
 # Legacy path — used for one-time migration from the old name
 _LEGACY_CONFIG_DIR = Path.home() / ".ai-file-sorter"
@@ -95,6 +96,12 @@ SORT_STRATEGIES = {
 FULL_TEXT_SIZE_LIMIT = 200 * 1024  # 200 KB
 FULL_SAMPLE_CHARS = 8000  # more chars in full mode
 
+# Default exclusion patterns (skipped during sorting)
+DEFAULT_EXCLUSIONS = [
+    "*.tmp", "*.bak", "*.part", "*.crdownload",
+    "desktop.ini", "Thumbs.db", ".DS_Store",
+]
+
 
 @dataclass
 class SortDirectory:
@@ -125,6 +132,9 @@ class AppConfig:
     quantization: str = "UD-IQ2_M"  # quantization format for the GGUF model
     yolo: bool = False  # YOLO mode: max context, no batching
     think: bool = False  # Show model reasoning during sorting
+    dry_run: bool = False  # Preview categorization without moving files
+    rename: bool = False  # Ask SLM to suggest better filenames
+    exclusions: List[str] = field(default_factory=list)  # glob patterns to skip
 
     # ── helpers ──────────────────────────────────────────────────────
 

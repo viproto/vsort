@@ -17,7 +17,7 @@ from rich.prompt import Confirm, Prompt
 from rich.table import Table
 from rich.text import Text
 
-from config import AppConfig, SortDirectory, SORT_MODES, MODEL_VARIANTS, QUANTIZATION_OPTIONS, SORT_STRATEGIES
+from config import AppConfig, SortDirectory, SORT_MODES, MODEL_VARIANTS, QUANTIZATION_OPTIONS, SORT_STRATEGIES, DEFAULT_EXCLUSIONS
 
 logger = logging.getLogger(__name__)
 console = Console()
@@ -275,6 +275,54 @@ def ask_sort_strategy() -> str:
     return selected
 
 
+# ── Exclusion patterns ─────────────────────────────────────────────────
+
+
+def ask_exclusions() -> List[str]:
+    """Ask the user which file patterns to exclude from sorting.
+
+    Returns a list of glob patterns.
+    """
+    console.print(Panel(
+        "[bold]Exclusion Patterns[/]\n"
+        "Choose file types to skip during sorting. These files will be left "
+        "in place and not categorized.",
+        border_style="red",
+    ))
+
+    # Show default patterns
+    console.print("  [bold]Suggested exclusions:[/]")
+    for pat in DEFAULT_EXCLUSIONS:
+        console.print(f"    [dim]-[/] {pat}")
+
+    use_defaults = Confirm.ask(
+        "\nUse default exclusion patterns?",
+        default=True,
+    )
+
+    exclusions: List[str] = []
+    if use_defaults:
+        exclusions = DEFAULT_EXCLUSIONS[:]
+        console.print(f"  [green]✓ Using {len(exclusions)} default patterns.[/]")
+    else:
+        console.print("  [dim]No default exclusions selected.[/]")
+
+    # Offer custom patterns
+    while Confirm.ask("Add a custom exclusion pattern?", default=False):
+        custom = Prompt.ask("  Pattern (e.g. *.log, *.temp, specific-file.txt)")
+        custom = custom.strip()
+        if custom:
+            exclusions.append(custom)
+            console.print(f"  [green]✓ Added: {custom}[/]")
+        else:
+            console.print("  [yellow]Empty pattern skipped.[/]")
+
+    if not exclusions:
+        console.print("  [dim]No exclusions — all files will be sorted.[/]")
+
+    return exclusions
+
+
 # ── Onboarding orchestration ──────────────────────────────────────────
 
 
@@ -307,7 +355,10 @@ def run_onboarding(cfg: AppConfig) -> None:
     # Step 6: quantization
     quantization = ask_quantization()
 
-    # Step 7: build SortDirectory list
+    # Step 7: exclusion patterns
+    exclusions = ask_exclusions()
+
+    # Step 8: build SortDirectory list
     sort_dirs: List[SortDirectory] = []
     for p in selected:
         sd = SortDirectory(
@@ -323,6 +374,7 @@ def run_onboarding(cfg: AppConfig) -> None:
     cfg.sort_strategy = sort_strategy
     cfg.model_variant = model_variant
     cfg.quantization = quantization
+    cfg.exclusions = exclusions
     cfg.initialized = True
     cfg.save()
 
