@@ -23,9 +23,9 @@ It can take from 15-60 minutes, depending on your device specs (SLM is hosted on
 
 ```--sort```: for headless launch (in task scheduler).
 
-```---think```: shows reasoning of the SLM, so you know how exactly the model is sorting your files.
+```--think```: shows reasoning of the SLM, so you know how exactly the model is sorting your files.
 
-:warning: ```---yolo```: EXPERIMENTAL, yeets all the files in one take, while increasing the maximum context. (Default - batches of 15 files, then finalise all contexts)
+:warning: ```--yolo```: EXPERIMENTAL, yeets all the files in one take, while increasing the maximum context. (Default - batches of 15 files, then finalise all contexts)
 
 
 ## Supported OS
